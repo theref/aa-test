@@ -26,6 +26,7 @@
 import "dotenv/config";
 import {
   createPublicClient,
+  createWalletClient,
   http,
   type Address,
   type Hex,
@@ -35,9 +36,9 @@ import {
   getAddress,
   hashTypedData,
   encodePacked,
+  parseEther,
   toHex,
   pad,
-  zeroAddress,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { sepolia } from "viem/chains";
@@ -298,15 +299,41 @@ async function main() {
 
   console.log(`📬  Safe address: ${wallet.address}`);
 
-  // ── Send a 0-ETH no-op UserOp ─────────────────────────────────────────────
+  // ── Fund the Safe so it can send value ─────────────────────────────────────
 
-  console.log(`\n🚀  Sending UserOp (0 ETH to zero address)…`);
+  const FUNDER_PK = ensureHexPrefix("FUNDER_PRIVATE_KEY");
+  const funder = privateKeyToAccount(FUNDER_PK);
+  console.log(`\n💰  Funder: ${funder.address}`);
+
+  const publicClient = createPublicClient({ chain: sepolia, transport: http(RPC_URL) });
+  const safeBalance = await publicClient.getBalance({ address: wallet.address });
+  console.log(`    Safe balance: ${safeBalance} wei`);
+
+  if (safeBalance < parseEther("0.0001")) {
+    console.log("    Funding Safe with 0.001 ETH…");
+    const walletClient = createWalletClient({
+      account: funder,
+      chain: sepolia,
+      transport: http(RPC_URL),
+    });
+    const fundTx = await walletClient.sendTransaction({
+      to: wallet.address,
+      value: parseEther("0.001"),
+    });
+    console.log(`    Funding tx: ${fundTx}`);
+    await publicClient.waitForTransactionReceipt({ hash: fundTx });
+    console.log("    Funded ✓");
+  }
+
+  // ── Send 1 wei to the funder address ───────────────────────────────────────
+
+  console.log(`\n🚀  Sending UserOp (1 wei to 0x3B42…c600)…`);
 
   let userOpHash: Hex;
   try {
     userOpHash = await wallet.client.sendUserOperation({
       account: wallet.account,
-      calls: [{ to: zeroAddress, value: 0n, data: "0x" }],
+      calls: [{ to: "0x3B42d26E19FF860bC4dEbB920DD8caA53F93c600" as Address, value: 1n, data: "0x" }],
     });
     console.log(`    UserOp hash: ${userOpHash}`);
   } catch (err) {
