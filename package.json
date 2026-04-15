@@ -5,7 +5,8 @@
     "test": "tsx src/index.ts",
     "safe-test": "tsx src/safe-1271-test.ts",
     "rhinestone-test": "tsx src/rhinestone-1271-test.ts",
-    "taco-safe": "tsx src/taco-safe-wallet.ts"
+    "taco-safe": "tsx src/taco-safe-wallet.ts",
+    "rhinestone-safe-test": "tsx src/rhinestone-safe-1271-test.ts"
   },
   "dependencies": {
     "@rhinestone/sdk": "^1.4.2",
