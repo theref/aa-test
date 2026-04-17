@@ -12,14 +12,12 @@
  *     └─ modules:
  *          └─ OwnableValidator (owners=[TACo ThresholdSigningMultisig], threshold=1)
  *
- * Signing flow:
+ * Signing flow (mirrors discord-taco-web pattern):
  *
- *   1. Pimlico prepares UserOp (gas estimation uses ECDSA-path mock)
- *   2. Client computes standard v0.7 userOpHash
- *   3. Client sends UserOp to TACo lynx nodes via Porter
- *   4. Nodes compute v0.7 hash + eth_sign wrapping, sign with threshold ECDSA
- *   5. Client wraps aggregated signature in Safe v=0 contract-sig format
- *   6. Pimlico submits to Base Sepolia
+ *   1. prepareUserOperation() — gas estimation with ECDSA stub + verificationGasLimit override
+ *   2. signUserOp() — TACo lynx nodes compute v0.7 hash + EIP-191 wrapping + ECDSA sign
+ *   3. Wrap aggregated signature in Safe v=0 contract-sig format
+ *   4. sendUserOperation() — submit with real signature, no re-estimation
  *
  * Key insight: OwnableValidator applies eth_sign wrapping before calling
  * isValidSignature on the 1271 contract. TACo's '0.7.0' aaVersion also
@@ -42,18 +40,18 @@ import {
   encodeFunctionData,
   encodeAbiParameters,
   getAddress,
+  getUserOperationHash,
   hashMessage,
   pad,
   parseEther,
   toHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { baseSepolia, sepolia } from "viem/chains";
+import { baseSepolia } from "viem/chains";
 import {
   createBundlerClient,
   createPaymasterClient,
   entryPoint07Address,
-  getUserOperationHash,
   toSmartAccount,
 } from "viem/account-abstraction";
 import { RhinestoneSDK } from "@rhinestone/sdk";
@@ -193,32 +191,6 @@ const encode7579Calls = (calls: Array<{ to: Address; value?: bigint; data?: Hex 
 };
 
 // ───────────────────────────────────────────────────────────────────────────────
-// Convert viem UserOp params to TACo UserOperationToSign
-// ───────────────────────────────────────────────────────────────────────────────
-
-function viemParamsToTacoUserOp(params: any, sender: Address): UserOperationToSign {
-  return {
-    sender,
-    nonce: BigInt(params.nonce),
-    callData: params.callData as `0x${string}`,
-    callGasLimit: BigInt(params.callGasLimit),
-    verificationGasLimit: BigInt(params.verificationGasLimit),
-    preVerificationGas: BigInt(params.preVerificationGas),
-    maxFeePerGas: BigInt(params.maxFeePerGas),
-    maxPriorityFeePerGas: BigInt(params.maxPriorityFeePerGas),
-    factory: params.factory as `0x${string}` | undefined,
-    factoryData: params.factoryData as `0x${string}` | undefined,
-    paymaster: params.paymaster as `0x${string}` | undefined,
-    paymasterVerificationGasLimit: params.paymasterVerificationGasLimit
-      ? BigInt(params.paymasterVerificationGasLimit) : undefined,
-    paymasterPostOpGasLimit: params.paymasterPostOpGasLimit
-      ? BigInt(params.paymasterPostOpGasLimit) : undefined,
-    paymasterData: params.paymasterData as `0x${string}` | undefined,
-    signature: "0x",
-  };
-}
-
-// ───────────────────────────────────────────────────────────────────────────────
 // Main
 // ───────────────────────────────────────────────────────────────────────────────
 
@@ -238,34 +210,21 @@ async function main() {
   await initialize();
 
   // Ethers provider for SigningCoordinator reads (lives on Sepolia)
-  const ethersProvider = new ethers.providers.JsonRpcProvider(COORDINATOR_RPC_URL);
+  const ethersProvider = new ethers.providers.JsonRpcProvider(
+    COORDINATOR_RPC_URL,
+    { name: "sepolia", chainId: 11155111 },
+  );
 
   const publicClient = createPublicClient({ chain: CHAIN, transport: http(RPC_URL) });
-  const bundlerClient = createBundlerClient({
-    client: publicClient,
-    chain: CHAIN,
+
+  // Bundler + paymaster — mirrors discord-taco-web pattern
+  const paymasterClient = createPaymasterClient({
     transport: http(BUNDLER_URL),
-    // Paymaster disabled — ECDSA stub sig underestimates verification gas
-    // for the contract signature path (v=0 → isValidSignature external call).
-    // Safe pays gas from its own balance instead.
-    userOperation: {
-      estimateFeesPerGas: async () => {
-        const resp = await fetch(BUNDLER_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            jsonrpc: "2.0", id: 1,
-            method: "pimlico_getUserOperationGasPrice",
-            params: [],
-          }),
-        });
-        const { result } = (await resp.json()) as any;
-        return {
-          maxFeePerGas: BigInt(result.fast.maxFeePerGas),
-          maxPriorityFeePerGas: BigInt(result.fast.maxPriorityFeePerGas),
-        };
-      },
-    },
+  });
+  const bundlerClient = createBundlerClient({
+    transport: http(BUNDLER_URL),
+    paymaster: paymasterClient,
+    chain: CHAIN,
   });
 
   // ──────────────────────────────────────────────────────────────────────────
@@ -312,7 +271,7 @@ async function main() {
   }
 
   // ──────────────────────────────────────────────────────────────────────────
-  // 3. Build viem smart account with TACo signing
+  // 3. Build viem smart account (for prepareUserOperation)
   // ──────────────────────────────────────────────────────────────────────────
 
   const isDeployed = async () => {
@@ -356,61 +315,96 @@ async function main() {
       return MOCK_ECDSA_SIG;
     },
 
-    async signUserOperation(params: any) {
-      // Compute the standard v0.7 userOpHash for logging
-      const userOpHash = getUserOperationHash({
-        userOperation: { ...params, sender: accountAddress, signature: "0x" },
-        entryPointAddress: entryPoint07Address,
-        entryPointVersion: "0.7",
-        chainId: params.chainId ?? CHAIN.id,
-      });
-      console.log(`\nuserOpHash (v0.7): ${userOpHash}`);
-      console.log(`ethSignedHash:     ${hashMessage({ raw: userOpHash })}`);
-
-      // Convert viem params to TACo UserOperationToSign format
-      const tacoUserOp = viemParamsToTacoUserOp(params, accountAddress);
-
-      console.log(`\nSending to TACo ${TACO_DOMAIN} cohort ${TACO_COHORT_ID}...`);
-
-      // Call TACo threshold signing network
-      const signResult = await signUserOp(
-        ethersProvider,
-        TACO_DOMAIN as any,
-        TACO_COHORT_ID,
-        CHAIN.id,           // Base Sepolia chain ID for hash computation
-        tacoUserOp,
-        "0.7.0",
-        undefined,           // No condition context for now
-      );
-
-      console.log(`TACo messageHash:  ${signResult.messageHash}`);
-      console.log(`TaCo signers:      ${Object.keys(signResult.signingResults).length}`);
-      Object.entries(signResult.signingResults).forEach(([ursula, sig]) =>
-        console.log(`  ${ursula}: ${sig.signerAddress} -> ${sig.signature.slice(0, 20)}...`));
-
-      // Wrap TaCo's aggregated signature in Safe v=0 contract-sig format
-      return wrapAsContractSig(TACO_MULTISIG, signResult.aggregatedSignature as Hex);
-    },
-
+    // signUserOperation is not used — we sign manually after prepareUserOperation
+    async signUserOperation() { return "0x" as Hex; },
     async signMessage() { throw new Error("not used"); },
     async signTypedData() { throw new Error("not used"); },
     async decodeCalls() { throw new Error("not implemented"); },
   });
 
   // ──────────────────────────────────────────────────────────────────────────
-  // 4. Send a UserOp (1 wei transfer)
+  // 4. Prepare UserOp (gas estimation with stub sig + gas override)
   // ──────────────────────────────────────────────────────────────────────────
 
   console.log(`\nSending 1 wei from Safe to ${funder.address}...`);
 
-  // Override verificationGasLimit: the ECDSA mock sig used during estimation
-  // produces a much lower gas figure than the real contract sig path
-  // (v=0 → external call to isValidSignature on the 1271 contract).
-  const userOpHash = await bundlerClient.sendUserOperation({
+  const userOp = await bundlerClient.prepareUserOperation({
     account: smartAccount,
     calls: [{ to: funder.address, value: 1n, data: "0x" }],
-    verificationGasLimit: 500_000n,
+    // Gas prices must be set before paymaster stub request
+    maxFeePerGas: 3_000_000_000n,
+    maxPriorityFeePerGas: 3_000_000_000n,
+    // Conservative verificationGasLimit for the contract signature path
+    // (v=0 → external isValidSignature call). ECDSA stub underestimates.
+    // Same approach as discord-taco-web/src/signing/taco-signer.ts:230
+    verificationGasLimit: BigInt(500_000),
   });
+
+  console.log(`  nonce:    ${userOp.nonce}`);
+  console.log(`  callGas:  ${userOp.callGasLimit}`);
+  console.log(`  verGas:   ${userOp.verificationGasLimit}`);
+  console.log(`  preVerGas:${userOp.preVerificationGas}`);
+  if (userOp.paymaster) {
+    console.log(`  paymaster:${userOp.paymaster}`);
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 5. Sign with TACo
+  // ──────────────────────────────────────────────────────────────────────────
+
+  // Build TACo UserOperationToSign from the prepared UserOp
+  const tacoUserOp: UserOperationToSign = {
+    sender: accountAddress,
+    nonce: BigInt(userOp.nonce),
+    callData: userOp.callData as `0x${string}`,
+    callGasLimit: BigInt(userOp.callGasLimit),
+    verificationGasLimit: BigInt(userOp.verificationGasLimit),
+    preVerificationGas: BigInt(userOp.preVerificationGas),
+    maxFeePerGas: BigInt(userOp.maxFeePerGas),
+    maxPriorityFeePerGas: BigInt(userOp.maxPriorityFeePerGas),
+    factory: userOp.factory as `0x${string}` | undefined,
+    factoryData: userOp.factoryData as `0x${string}` | undefined,
+    paymaster: userOp.paymaster as `0x${string}` | undefined,
+    paymasterVerificationGasLimit: userOp.paymasterVerificationGasLimit
+      ? BigInt(userOp.paymasterVerificationGasLimit) : undefined,
+    paymasterPostOpGasLimit: userOp.paymasterPostOpGasLimit
+      ? BigInt(userOp.paymasterPostOpGasLimit) : undefined,
+    paymasterData: userOp.paymasterData as `0x${string}` | undefined,
+    signature: "0x",
+  };
+
+  console.log(`\nSigning with TACo ${TACO_DOMAIN} cohort ${TACO_COHORT_ID}...`);
+  const startTime = Date.now();
+
+  const signResult = await signUserOp(
+    ethersProvider,
+    TACO_DOMAIN as any,
+    TACO_COHORT_ID,
+    CHAIN.id,
+    tacoUserOp,
+    "0.7.0",
+    undefined,
+  );
+
+  const signingTimeMs = Date.now() - startTime;
+  console.log(`TACo signed in ${signingTimeMs}ms`);
+  console.log(`  messageHash: ${signResult.messageHash}`);
+  console.log(`  signers:     ${Object.keys(signResult.signingResults).length}`);
+  Object.entries(signResult.signingResults).forEach(([ursula, sig]) =>
+    console.log(`    ${ursula}: ${sig.signerAddress}`));
+
+  // Wrap TACo's aggregated signature in Safe v=0 contract-sig format
+  const signature = wrapAsContractSig(TACO_MULTISIG, signResult.aggregatedSignature as Hex);
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 6. Submit to bundler (no re-estimation)
+  // ──────────────────────────────────────────────────────────────────────────
+
+  console.log("\nSubmitting to bundler...");
+  const userOpHash = await bundlerClient.sendUserOperation({
+    ...(userOp as object),
+    signature,
+  } as any);
   console.log(`UserOp hash: ${userOpHash}`);
 
   const receipt = await bundlerClient.waitForUserOperationReceipt({
@@ -427,6 +421,7 @@ async function main() {
   console.log(`  Tx hash   : ${receipt.receipt.transactionHash}`);
   console.log(`  Block     : ${receipt.receipt.blockNumber}`);
   console.log(`  Gas used  : ${receipt.receipt.gasUsed}`);
+  console.log(`  Signing   : ${signingTimeMs}ms`);
   console.log(`  Safe      : ${accountAddress}`);
   console.log(`  1271 owner: ${TACO_MULTISIG} (TACo cohort ${TACO_COHORT_ID})`);
   console.log("──────────────────────────────────────────────────\n");
