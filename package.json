@@ -6,11 +6,16 @@
     "safe-test": "tsx src/safe-1271-test.ts",
     "rhinestone-test": "tsx src/rhinestone-1271-test.ts",
     "taco-safe": "tsx src/taco-safe-wallet.ts",
-    "rhinestone-safe-test": "tsx src/rhinestone-safe-1271-test.ts"
+    "rhinestone-safe-test": "tsx src/rhinestone-safe-1271-test.ts",
+    "rhinestone-taco-test": "tsx src/rhinestone-taco-test.ts"
   },
   "dependencies": {
+    "@nucypher/shared": "file:../taco-web/packages/shared",
+    "@nucypher/taco": "file:../taco-web/packages/taco",
+    "@nucypher/taco-auth": "file:../taco-web/packages/taco-auth",
     "@rhinestone/sdk": "^1.4.2",
     "dotenv": "^16.4.5",
+    "ethers": "^5.8.0",
     "permissionless": "^0.2.37",
     "viem": "^2.28.3"
   },
